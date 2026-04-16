@@ -1,0 +1,125 @@
+import type React from "react"
+import type { Metadata, Viewport } from "next"
+import { GeistSans } from "geist/font/sans"
+import { GeistMono } from "geist/font/mono"
+import { Analytics } from "@vercel/analytics/next"
+import { ThemeProvider } from "@/components/theme-provider"
+import { AuthProvider } from "@/hooks/use-auth"
+import { Suspense } from "react"
+import { RouteGuard } from "@/components/route-guard"
+import { ErrorBoundary } from "@/components/error-boundary"
+import { CustomThemeApplier } from "@/components/custom-theme-applier"
+import { GlobalSubscriptionCheck } from "@/components/auth/global-subscription-check"
+import { SwipeTransition } from "@/components/layout/swipe-transition"
+import "./globals.css"
+
+// Метаданные (название и описание)
+export const metadata: Metadata = {
+  title: "MIREA QR Bot",
+  description: "Telegram Mini App для студентов МИРЭА - отметка посещаемости, расписание, успеваемость",
+}
+
+// Настройки экрана и цвета темы (исправляет варнинги Next.js)
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  maximumScale: 1,
+  userScalable: false,
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#ffffff" },
+    { media: "(prefers-color-scheme: dark)", color: "#1a1a1a" },
+  ],
+}
+
+export default function RootLayout({
+  children,
+}: Readonly<{
+  children: React.ReactNode
+}>) {
+  return (
+    <html lang="ru" suppressHydrationWarning>
+    <head>
+      <script dangerouslySetInnerHTML={{__html: `
+(function(){try{
+  var h=localStorage.getItem('custom_primary_hue');
+  var b=localStorage.getItem('custom_primary_brightness');
+  var bgh=localStorage.getItem('custom_bg_hue');
+  var bgb=localStorage.getItem('custom_bg_brightness');
+  var bgs=localStorage.getItem('custom_bg_saturation');
+  var r=document.documentElement;
+  var css='';
+  if(h!==null||b!==null){
+    var hv=h!==null?+h:267;
+    var bv=b!==null?+b:60;
+    var L=(0.12+(bv/100)*0.84).toFixed(3);
+    var La=Math.min(+L+0.07,0.85).toFixed(3);
+    var Lr=Math.max(+L-0.08,0.3).toFixed(3);
+    r.style.setProperty('--primary','oklch('+L+' 0.22 '+hv+')');
+    r.style.setProperty('--primary-foreground','oklch(1 0 0)');
+    r.style.setProperty('--accent','oklch('+La+' 0.17 '+hv+')');
+    r.style.setProperty('--accent-foreground','oklch(1 0 0)');
+    r.style.setProperty('--ring','oklch('+Lr+' 0.14 '+hv+')');
+    r.style.setProperty('--sidebar-primary','oklch('+Lr+' 0.15 '+hv+')');
+    r.style.setProperty('--sidebar-ring','oklch('+Lr+' 0.15 '+hv+')');
+    css+='--primary:oklch('+L+' 0.22 '+hv+');--primary-foreground:oklch(1 0 0);';
+    css+='--accent:oklch('+La+' 0.17 '+hv+');--accent-foreground:oklch(1 0 0);';
+    css+='--ring:oklch('+Lr+' 0.14 '+hv+');--sidebar-primary:oklch('+Lr+' 0.15 '+hv+');--sidebar-ring:oklch('+Lr+' 0.15 '+hv+');';
+  }
+  if(bgh!==null||bgb!==null||bgs!==null){
+    var bhv=bgh!==null?+bgh:95;
+    var bbv=bgb!==null?+bgb:70;
+    var bsv=bgs!==null?+bgs:50;
+    var Lb=(0.12+(bbv/100)*0.87).toFixed(3);
+    var m=(bsv/50).toFixed(4);
+    var Lc=Math.min(+Lb+0.08,0.99).toFixed(3);
+    var Lm=Math.max(+Lb-0.03,0.4).toFixed(3);
+    var Li=Math.max(+Lb-0.05,0.4).toFixed(3);
+    var Ls=Math.min(+Lb+0.05,0.99).toFixed(3);
+    r.style.setProperty('--background','oklch('+Lb+' '+(0.025*+m).toFixed(4)+' '+bhv+')');
+    r.style.setProperty('--secondary','oklch('+Lb+' '+(0.025*+m).toFixed(4)+' '+bhv+')');
+    r.style.setProperty('--muted','oklch('+Lm+' '+(0.018*+m).toFixed(4)+' '+bhv+')');
+    r.style.setProperty('--input','oklch('+Li+' '+(0.018*+m).toFixed(4)+' '+bhv+')');
+    r.style.setProperty('--sidebar','oklch('+Ls+' '+(0.018*+m).toFixed(4)+' '+bhv+')');
+    r.style.setProperty('--sidebar-accent','oklch('+Lm+' '+(0.018*+m).toFixed(4)+' '+bhv+')');
+    r.style.setProperty('--card','oklch('+Lc+' '+(0.008*+m).toFixed(4)+' '+bhv+')');
+    r.style.setProperty('--popover','oklch('+Lc+' '+(0.008*+m).toFixed(4)+' '+bhv+')');
+    css+='--background:oklch('+Lb+' '+(0.025*+m).toFixed(4)+' '+bhv+');--secondary:oklch('+Lb+' '+(0.025*+m).toFixed(4)+' '+bhv+');';
+    css+='--muted:oklch('+Lm+' '+(0.018*+m).toFixed(4)+' '+bhv+');--input:oklch('+Li+' '+(0.018*+m).toFixed(4)+' '+bhv+');';
+    css+='--sidebar:oklch('+Ls+' '+(0.018*+m).toFixed(4)+' '+bhv+');--sidebar-accent:oklch('+Lm+' '+(0.018*+m).toFixed(4)+' '+bhv+');';
+    css+='--card:oklch('+Lc+' '+(0.008*+m).toFixed(4)+' '+bhv+');--popover:oklch('+Lc+' '+(0.008*+m).toFixed(4)+' '+bhv+');';
+  }
+  if(css){
+    var s=document.createElement('style');
+    s.id='ct';
+    s.textContent=':root:root{'+css+'}';
+    document.head.appendChild(s);
+  }
+}catch(e){}})();
+      `}} />
+    </head>
+    <body className={`font-sans ${GeistSans.variable} ${GeistMono.variable} antialiased`}>
+    <ErrorBoundary>
+      <Suspense fallback={null}>
+        {/* Убрали "march" из тем */}
+        <ThemeProvider attribute="class" defaultTheme="system" enableSystem disableTransitionOnChange themes={["light", "dark"]}>
+          <CustomThemeApplier />
+          <AuthProvider>
+            <RouteGuard>
+              <GlobalSubscriptionCheck>
+                {/* === ОБЕРТКА ДЛЯ СВАЙПОВ === */}
+                <SwipeTransition>
+                  {children}
+                </SwipeTransition>
+              </GlobalSubscriptionCheck>
+            </RouteGuard>
+          </AuthProvider>
+          {/* FlowerWrapper полностью удален отсюда */}
+        </ThemeProvider>
+      </Suspense>
+    </ErrorBoundary>
+    <Analytics/>
+    <script src="https://telegram.org/js/telegram-web-app.js"></script>
+    </body>
+    </html>
+  )
+}

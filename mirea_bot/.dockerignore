@@ -1,0 +1,6 @@
+# Исключаем тяжелые папки из контекста сборки
+frontend/node_modules
+frontend/.next
+frontend/npm-debug.log
+node_modules
+.git

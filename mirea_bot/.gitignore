@@ -1,0 +1,12 @@
+.env*
+!.env.example
+.DS_Store
+certs
+storage
+.idea
+
+# Next.js
+frontend/out
+frontend/.next
+frontend/node_modules
+docker-compose.override.yml
