@@ -26,17 +26,12 @@ func NewBot(cfg config.Config, redisClient *redis.Client) *tgbotapi.BotAPI {
 	if err != nil {
 		log.Printf("Не удалось подключиться к Telegram напрямую: %v", err)
 		log.Fatal("fatal error: отсутствует подключение к Telegram Bot API")
-		
-		// ЕСЛИ ТВОЙ СЕРВЕР В РФ И ТЕЛЕГРАМ ЗАБЛОКИРОВАН, 
-		// Раскомментируй блок ниже и вставь рабочий HTTP-прокси для Telegram:
-		/*
-		proxyUrl, _ := url.Parse("http://ТВОЙ_ПРОКСИ_ДЛЯ_ТЕЛЕГРАМА:ПОРТ")
+		proxyUrl, _ := url.Parse("http://")
 		client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyUrl)}}
 		bot, err = tgbotapi.NewBotAPIWithClient(cfg.TelegramBotToken, tgbotapi.APIEndpoint, client)
 		if err != nil {
 			log.Fatalf("fatal error: не удалось подключиться к Telegram даже через прокси: %v", err)
 		}
-		*/
 	}
 
 	u := tgbotapi.NewUpdate(0)

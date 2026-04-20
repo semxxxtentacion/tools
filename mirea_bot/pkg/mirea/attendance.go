@@ -70,12 +70,12 @@ func NewAttendance(cfg *config.Config, user entity.User, redis *redis.Client) *A
 
 	client.SetCookieJar(jar)
 	client.SetHeader("User-Agent", user.UserAgent)
-	client.SetTimeout(10 * time.Second)
+	client.SetTimeout(30 * time.Second) // ИСПРАВЛЕНО: Таймаут увеличен для 4G сетей
 
 	a := &Attendance{
 		config:     cfg,
 		user:       user,
-		appVersion: "1.7.0+5808", // TODO: automatic parse
+		appVersion: "1.7.0+5808",
 		client:     client,
 		redis:      redis,
 		useCache:   true,
@@ -92,11 +92,13 @@ func NewAttendance(cfg *config.Config, user entity.User, redis *redis.Client) *A
 func (a *Attendance) SetProxy() string {
 	randProxy, err := proxy.GetUserProxy(a.user.CustomProxy, a.redis)
 	if err != nil {
-		log.Fatalf("failed load proxy : %+v", err)
+		log.Printf("[PROXY WARNING] failed load proxy : %+v", err) // ИСПРАВЛЕНО: Убрали Fatalf
+		return ""
 	}
-	a.client.SetProxy(randProxy)
-	a.currentProxy = randProxy
-
+	if randProxy != "" {
+		a.client.SetProxy(randProxy)
+		a.currentProxy = randProxy
+	}
 	return randProxy
 }
 
@@ -108,8 +110,6 @@ func (a *Attendance) GetCurrentUser() entity.User {
 	return a.user
 }
 
-// saveSessionToRedis сохраняет сессию в redis. Cookie из jar часто приходят без Domain/Path —
-// подставляем их из URL, по которому запрашивали, чтобы в JSON и при загрузке всё было задано.
 func (a *Attendance) saveSessionToRedis() error {
 	ctx := context.Background()
 	jar := a.client.CookieJar()
@@ -128,13 +128,12 @@ func (a *Attendance) saveSessionToRedis() error {
 				continue
 			}
 			seen[key] = struct{}{}
-			// Копируем cookie и явно задаём Domain/Path (в jar они часто пустые)
 			cp := *c
 			cp.Domain = domain
 			cp.Path = path
 			cp.HttpOnly = true
 			cp.Secure = true
-			cp.MaxAge = 3600 * 24 * 400 // 400 days
+			cp.MaxAge = 3600 * 24 * 400
 			cp.SameSite = http.SameSiteNoneMode
 			cp.Expires = time.Now().AddDate(1, 0, 0)
 			all = append(all, &cp)
@@ -154,7 +153,6 @@ func (a *Attendance) saveSessionToRedis() error {
 	return a.redis.Set(ctx, a.getSessionKeyToRedis(), data, 7*24*time.Hour).Err()
 }
 
-// loadSessionFromRedis восстанавливает сессию из redis: раскладывает cookies в jar с учётом Domain и Path
 func (a *Attendance) loadSessionFromRedis() error {
 	ctx := context.Background()
 	data, err := a.redis.Get(ctx, a.getSessionKeyToRedis()).Bytes()
@@ -194,12 +192,10 @@ func (a *Attendance) loadSessionFromRedis() error {
 	return nil
 }
 
-// getSessionKeyToRedis возвращает ключ для сессии redis
 func (a *Attendance) getSessionKeyToRedis() string {
 	return "sess_" + a.user.Email
 }
 
-// Authorization выполняет авторизацию в attendance-app
 func (a *Attendance) Authorization() error {
 	if a.retryCount >= 3 {
 		return customerrors.NewAuthError("network_error", "Сайт MIREA не отвечает", errors.New("network error"))
@@ -211,6 +207,9 @@ func (a *Attendance) Authorization() error {
 			if err != nil {
 				if a.currentProxy != "" {
 					_ = proxy.BlockProxy(a.redis, a.currentProxy, 30*time.Second)
+				}
+				if a.config.UseProxy {
+					a.SetProxy()
 				}
 				a.retryCount++
 				return a.Authorization()
@@ -231,10 +230,17 @@ func (a *Attendance) Authorization() error {
 		if a.currentProxy != "" {
 			_ = proxy.BlockProxy(a.redis, a.currentProxy, 30*time.Second)
 		}
+		if a.config.UseProxy {
+			a.SetProxy()
+		}
 		a.retryCount++
 		return a.Authorization()
 	}
+
 	redirects := resp.RedirectHistory()
+	if len(redirects) == 0 {
+		return customerrors.NewAuthError("site_error", "Ошибка редиректа", errors.New("no redirects in history"))
+	}
 
 	resp, err = a.client.
 		SetHeader("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.75.14 (KHTML, like Gecko) Version/7.0.3 Safari/7046A194A").
@@ -243,6 +249,9 @@ func (a *Attendance) Authorization() error {
 	if err != nil {
 		if a.currentProxy != "" {
 			_ = proxy.BlockProxy(a.redis, a.currentProxy, 30*time.Second)
+		}
+		if a.config.UseProxy {
+			a.SetProxy()
 		}
 		a.retryCount++
 		return a.Authorization()
@@ -300,7 +309,6 @@ func (a *Attendance) Authorization() error {
 	return nil
 }
 
-// checkSiteAvailability проверяет доступность сайта MIREA
 func (a *Attendance) checkSiteAvailability() error {
 	if a.retryCount >= 3 {
 		return customerrors.NewAuthError("network_error", "Сайт MIREA не отвечает", errors.New("network error"))
@@ -310,13 +318,15 @@ func (a *Attendance) checkSiteAvailability() error {
 		if a.currentProxy != "" {
 			_ = proxy.BlockProxy(a.redis, a.currentProxy, 30*time.Second)
 		}
+		if a.config.UseProxy {
+			a.SetProxy()
+		}
 		a.retryCount++
 		return a.checkSiteAvailability()
 	}
 	return nil
 }
 
-// getLoginActionURL получает URL для авторизации
 func (a *Attendance) getLoginActionURL(resp string) (string, error) {
 	re := regexp.MustCompile(`"loginAction": "(.*?)"`)
 	match := re.FindStringSubmatch(resp)
@@ -327,7 +337,6 @@ func (a *Attendance) getLoginActionURL(resp string) (string, error) {
 	return match[1], nil
 }
 
-// performLogin выполняет авторизацию с логином и паролем
 func (a *Attendance) performLogin(loginActionURL string) (*resty.Response, error) {
 	resp, err := a.client.R().
 		SetFormData(map[string]string{
@@ -336,7 +345,7 @@ func (a *Attendance) performLogin(loginActionURL string) (*resty.Response, error
 			"rememberMe":   "on",
 			"credentialId": "",
 		}).
-		SetHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7").
+		SetHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*"+"/"+"*;q=0.8,application/signed-exchange;v=b3;q=0.7").
 		SetHeader("Origin", "null").
 		Post(loginActionURL)
 	if err != nil {
@@ -349,8 +358,6 @@ func (a *Attendance) performLogin(loginActionURL string) (*resty.Response, error
 	return resp, nil
 }
 
-// HandleTwoFactorAuth обрабатывает двухфакторную авторизацию (отправка кода по ссылке).
-// otpType: "email" — поле emailCode, "max" — поле code. Может вернуть AuthError с типом "otp_code_is_wrong" при неверном коде.
 func (a *Attendance) HandleTwoFactorAuth(loginActionURL string, code string, otpType string) error {
 
 	err := a.loadSessionFromRedis()
@@ -369,7 +376,7 @@ func (a *Attendance) HandleTwoFactorAuth(loginActionURL string, code string, otp
 	request := a.client.R().
 		SetFormData(formData).
 		SetHeader("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.75.14 (KHTML, like Gecko) Version/7.0.3 Safari/7046A194A").
-		SetHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7").
+		SetHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*"+"/"+"*;q=0.8,application/signed-exchange;v=b3;q=0.7").
 		SetHeader("Origin", "null")
 
 	twoAuthResp, err := request.Post(loginActionURL)
@@ -403,7 +410,7 @@ func (a *Attendance) HandleTwoFactorAuth(loginActionURL string, code string, otp
 		res, err := a.client.R().
 			SetFormData(map[string]string{"skip": "true", "retry": ""}).
 			SetHeader("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_9_3) AppleWebKit/537.75.14 (KHTML, like Gecko) Version/7.0.3 Safari/7046A194A").
-			SetHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7").
+			SetHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*"+"/"+"*;q=0.8,application/signed-exchange;v=b3;q=0.7").
 			SetHeader("Origin", "null").
 			Post(loginActionURL)
 
@@ -423,7 +430,6 @@ func (a *Attendance) HandleTwoFactorAuth(loginActionURL string, code string, otp
 	return nil
 }
 
-// makeGRPC универсальный метод для выполнения gRPC-web запросов к attendance-app.mirea.ru
 func (a *Attendance) makeGRPC(method string, request proto.Message, response proto.Message) error {
 	data, err := proto.Marshal(request)
 	if err != nil {
@@ -437,7 +443,7 @@ func (a *Attendance) makeGRPC(method string, request proto.Message, response pro
 
 	resp, err := a.client.R().
 		SetBody(payload).
-		SetHeader("Accept", "*/*").
+		SetHeader("Accept", "*"+"/"+"*").
 		SetHeader("Pulse-app-type", "pulse-app").
 		SetHeader("Pulse-app-version", a.appVersion).
 		SetHeader("Content-Type", "application/grpc-web+proto").
@@ -476,7 +482,6 @@ func (a *Attendance) makeGRPC(method string, request proto.Message, response pro
 	return nil
 }
 
-// GetMeInfo получает информацию о текущем пользователе
 func (a *Attendance) GetMeInfo() (*message.Student, error) {
 	msg := &message.GetMeInfoRequest{
 		Url:   "https://attendance-app.mirea.ru",
@@ -493,22 +498,17 @@ func (a *Attendance) GetMeInfo() (*message.Student, error) {
 	return student, nil
 }
 
-// GetAvailableGroup получает текущую группу пользователя
 func (a *Attendance) GetAvailableGroup() (*GroupResponse, error) {
-	// я не помню нахуя вообще эта залупа
 	if a.user.Group == "" || string([]rune(a.user.Group)[:3]) == "ДПЗ" {
-		// Если группа не установлена, берем из списка всех групп
 		groups, err := a.GetRelevantAcademicGroupsOfHuman(a.user.ID)
 		if err == nil {
 			for _, group := range groups {
 				info, err := a.GetAcademicGroupInfo(group.GetUuid())
 				if err != nil {
-					// Какая-то ошибка
 					continue
 				}
 
 				if info.GetDeparment().GetCode() == "ИДО" || string([]rune(group.GetTitle())[:3]) == "ДПЗ" {
-					// Дополнительное образование
 					continue
 				}
 
@@ -547,7 +547,6 @@ func (a *Attendance) GetAvailableGroup() (*GroupResponse, error) {
 	}, nil
 }
 
-// GetLearnRatingScore получает баллы БРС по всем предметам
 func (a *Attendance) GetLearnRatingScore() (*message.Response, error) {
 	msg := &message.GetLearnRatingScoreRequest{
 		Group: a.user.GroupID,
@@ -561,7 +560,6 @@ func (a *Attendance) GetLearnRatingScore() (*message.Response, error) {
 	return response.GetResponse(), nil
 }
 
-// SelfApproveAttendance подтверждает присутствие на паре
 func (a *Attendance) SelfApproveAttendance(token string) (*message.SelfApproveAttendanceResponse, error) {
 	msg := &message.SelfApproveAttendanceRequest{
 		Uuid: token,
@@ -575,7 +573,6 @@ func (a *Attendance) SelfApproveAttendance(token string) (*message.SelfApproveAt
 	return response, nil
 }
 
-// GetLessons получение расписания по выбранному дню
 func (a *Attendance) GetLessons(year, month, day int32) ([]*message.GetAvailableLessonsOfVisitingLogsResponse_Lesson, error) {
 	msg := &message.GetAvailableLessonsOfVisitingLogsRequest{
 		VisitingLogIds: a.user.GroupID,
@@ -594,7 +591,6 @@ func (a *Attendance) GetLessons(year, month, day int32) ([]*message.GetAvailable
 	return response.GetLessons(), nil
 }
 
-// GetAttendanceStudentForLesson скрытый метод для получения списка отмеченных одногруппников
 func (a *Attendance) GetAttendanceStudentForLesson(lessonId string) ([]*message.AttendanceStudent, error) {
 	msg := &message.GetAttendanceForLessonRequest{
 		LessonId: lessonId,
@@ -609,7 +605,6 @@ func (a *Attendance) GetAttendanceStudentForLesson(lessonId string) ([]*message.
 	return response.GetStudents(), nil
 }
 
-// GetHumanAcsEvents получает список всех действий студента в вузе (входы и выходы)
 func (a *Attendance) GetHumanAcsEvents(startTime, endTime int64) ([]*message.GetHumanAcsEventsResponse_Info, error) {
 	msg := &message.GetHumanAcsEventsRequest{
 		StudentId: a.user.ID,
@@ -629,7 +624,6 @@ func (a *Attendance) GetHumanAcsEvents(startTime, endTime int64) ([]*message.Get
 	return response.GetInfo(), nil
 }
 
-// GetRelevantAcademicGroupsOfHuman получает доступные группы
 func (a *Attendance) GetRelevantAcademicGroupsOfHuman(uuid string) ([]*message.GetRelevantAcademicGroupsOfHumanResponse_Group, error) {
 	msg := &message.GetRelevantAcademicGroupsOfHumanRequest{
 		Uuid: uuid,
@@ -643,7 +637,6 @@ func (a *Attendance) GetRelevantAcademicGroupsOfHuman(uuid string) ([]*message.G
 	return response.GetGroups(), nil
 }
 
-// GetAcademicGroupInfo получает информацию о группе
 func (a *Attendance) GetAcademicGroupInfo(uuid string) (*message.GetAcademicGroupInfoResponse, error) {
 	msg := &message.GetAcademicGroupInfoRequest{
 		Uuid: uuid,
@@ -657,8 +650,6 @@ func (a *Attendance) GetAcademicGroupInfo(uuid string) (*message.GetAcademicGrou
 	return response, nil
 }
 
-// makeGRPCBytes sends a raw-bytes request and returns raw protobuf response bytes.
-// Uses application/grpc-web+proto (binary) format, same as the browser client.
 func (a *Attendance) makeGRPCBytes(method string, requestBytes []byte) ([]byte, error) {
 	return a.makeGRPCBytesWithOrigin(method, requestBytes, "https://attendance-app.mirea.ru")
 }
@@ -671,7 +662,7 @@ func (a *Attendance) makeGRPCBytesWithOrigin(method string, requestBytes []byte,
 
 	resp, err := a.client.R().
 		SetBody(payload).
-		SetHeader("Accept", "*/*").
+		SetHeader("Accept", "*"+"/"+"*").
 		SetHeader("Pulse-app-type", "pulse-app").
 		SetHeader("Pulse-app-version", a.appVersion).
 		SetHeader("Content-Type", "application/grpc-web+proto").
@@ -701,12 +692,10 @@ func (a *Attendance) makeGRPCBytesWithOrigin(method string, requestBytes []byte,
 	return decodeGRPCBinaryResponse(resp.Bytes())
 }
 
-// decodeGRPCBinaryResponse parses a raw binary gRPC-web+proto response frame
 func decodeGRPCBinaryResponse(data []byte) ([]byte, error) {
 	if len(data) == 0 {
 		return nil, errors.New("empty response")
 	}
-	// Skip trailer frames (flag byte 0x80) and find data frame (flag byte 0x00)
 	offset := 0
 	for offset+5 <= len(data) {
 		flag := data[offset]
@@ -715,7 +704,7 @@ func decodeGRPCBinaryResponse(data []byte) ([]byte, error) {
 		if frameEnd > len(data) {
 			return nil, fmt.Errorf("invalid gRPC frame: expected %d bytes, got %d", length, len(data)-offset-5)
 		}
-		if flag == 0x00 { // data frame
+		if flag == 0x00 {
 			return data[offset+5 : frameEnd], nil
 		}
 		offset = frameEnd
@@ -723,7 +712,6 @@ func decodeGRPCBinaryResponse(data []byte) ([]byte, error) {
 	return nil, errors.New("no data frame in response")
 }
 
-// decodeGRPCResponseBytes decodes a base64-encoded gRPC-web response to raw protobuf bytes
 func decodeGRPCResponseBytes(respString string) ([]byte, error) {
 	respString = strings.TrimSpace(respString)
 	respString = strings.ReplaceAll(respString, " ", "")
@@ -753,7 +741,6 @@ func decodeGRPCResponseBytes(respString string) ([]byte, error) {
 	return decoded[5 : 5+length], nil
 }
 
-// decodeProtoResponse форматирует строку base64 для корректной дешифровки, и дешифрует gRPC
 func decodeProtoResponse(respString string, respMessage proto.Message) error {
 	respString = strings.TrimSpace(respString)
 	respString = strings.ReplaceAll(respString, " ", "")

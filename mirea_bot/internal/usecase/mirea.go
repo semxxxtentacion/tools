@@ -256,14 +256,6 @@ func (c *MireaUseCase) GetLessons(user entity.User, request model.GetLessons) ([
 			teacher = teacherData.GetFamilyName() + " " + teacherData.GetName() + " " + middleName
 		}
 
-		//21.12.2025 убрали группы
-		//var groups []string
-		//if data.GetGroups() != nil {
-		//	for _, group := range data.GetGroups() {
-		//		groups = append(groups, group.GetTitle())
-		//	}
-		//}
-
 		lessonsResponse = append(lessonsResponse, model.LessonResponse{
 			Uuid:       data.GetUuid(),
 			Auditorium: data.GetRoom().GetNumber(),
@@ -401,16 +393,17 @@ func (c *MireaUseCase) ScanQR(ctx context.Context, request *model.ScanQRRequest,
 	if len(parts) < 2 {
 		return worker.response, fiber.NewError(400, "QR код не относится к МИРЭА")
 	}
-	worker.uuid = parts[1]
+	
+	// Очищаем токен от лишнего мусора, который могут добавить сканеры
+	token := parts[1]
+	token = strings.Split(token, "&")[0]
+	token = strings.Split(token, "#")[0]
+	worker.uuid = token
 
 	var links []*entity.LinkUser
 	if err := c.LinkUserRepository.GetConnectedByUser(tx, &links, request.FromUserId); err != nil {
 		//return worker.response, fiber.NewError(500, "Не удалось получить студентов")
 	}
-
-	//if len(links) == 0 {
-	//	return worker.response, fiber.NewError(400, "Нельзя отмечать только себя")
-	//}
 
 	for _, link := range links {
 		if !link.Enabled {
@@ -428,20 +421,23 @@ func (c *MireaUseCase) ScanQR(ctx context.Context, request *model.ScanQRRequest,
 }
 
 func (w *WorkerQR) Start() {
-	for _, user := range w.users {
-		go func(user entity.User) {
+	for i, user := range w.users {
+		// Добавляем искусственную задержку, чтобы размазать запросы 
+		// и избежать блокировки 403 Forbidden от DDoS-Guard МИРЭА
+		delay := time.Duration(i*400) * time.Millisecond
+
+		go func(u entity.User, d time.Duration) {
 			defer w.wg.Done()
+			time.Sleep(d)
 
-			telegramAlreadyNotificationErr := w.redis.Get(context.Background(), fmt.Sprintf("telegram_notification_%d", user.TelegramId)).Err()
-			telegramSendNotification := errors.Is(telegramAlreadyNotificationErr, redis.Nil) // true - если ключа нет
+			telegramAlreadyNotificationErr := w.redis.Get(context.Background(), fmt.Sprintf("telegram_notification_%d", u.TelegramId)).Err()
+			telegramSendNotification := errors.Is(telegramAlreadyNotificationErr, redis.Nil)
 
-			familyName := strings.Split(user.Fullname, " ")[0]
+			familyName := strings.Split(u.Fullname, " ")[0]
 
-			// Проверяем, был ли пользователь отмечен в последние минуты
-			attendanceStatusKey := fmt.Sprintf("attendance_status_%s", user.ID)
+			attendanceStatusKey := fmt.Sprintf("attendance_status_%s", u.ID)
 			cachedStatus := w.redis.Get(context.Background(), attendanceStatusKey)
 			if cachedStatus.Err() == nil {
-				// Если ключ существует, значит по пользователю был получен статус
 				w.mutex.Lock()
 				s, _ := cachedStatus.Int()
 				w.response.Students[familyName] = uint(s)
@@ -449,8 +445,7 @@ func (w *WorkerQR) Start() {
 				return
 			}
 
-			// Decrypt password for authorization
-			_, err := w.encryptor.Decrypt(user.Password)
+			_, err := w.encryptor.Decrypt(u.Password)
 			if err != nil {
 				w.mutex.Lock()
 				w.response.Students[familyName] = STATUS_ERROR
@@ -458,60 +453,48 @@ func (w *WorkerQR) Start() {
 				return
 			}
 
-			userWithDecryptedPassword := user
-			userWithDecryptedPassword.Password = "" // Очищаем пароль, чтобы фоновая отметка не спамила OTP
+			userWithDecryptedPassword := u
+			userWithDecryptedPassword.Password = "" 
 
 			attendance := mirea.NewAttendance(w.config, userWithDecryptedPassword, w.redis)
 			attendance.SetUseCase(true)
 			if err := attendance.Authorization(); err != nil {
-				// не удалось авторизоваться
 				w.mutex.Lock()
 				var authErr *customerrors.AuthError
 				if errors.As(err, &authErr) && (authErr.Type == "network_error" || authErr.Type == "site_unavailable" || authErr.Type == "internal_error") {
-					w.response.Students[familyName] = STATUS_ERROR // Показываем внутреннюю ошибку при лагах
+					w.response.Students[familyName] = STATUS_ERROR 
 				} else {
 					w.response.Students[familyName] = STATUS_NOT_AUTHORIZED
 				}
 				w.mutex.Unlock()
-				// Send notification about authorization failure
-				// notificationMessage := "🔐 Не удалось отметить вас на паре. Проблемы с авторизацией в системе МИРЭА. Проверьте логин и пароль в настройках."
-				// w.bot.Send(tgbotapi.NewMessage(user.TelegramId, notificationMessage))
 				fmt.Printf("%s - failed authorization for scan: %v\n", familyName, err)
 				return
 			}
+			
 			msg, err := attendance.SelfApproveAttendance(w.uuid)
+			
 			w.mutex.Lock()
 			if err != nil {
-				// внутренняя ошибка
+				// ТЕПЕРЬ МЫ ВЫВОДИМ ОШИБКУ, ЕСЛИ ОТМЕТКА УПАЛА
+				fmt.Printf("[SCAN ERROR] %s - gRPC request failed during SelfApproveAttendance: %v\n", familyName, err)
 				w.response.Students[familyName] = STATUS_UNKNOWN
-				// Сохраняем успешную отметку в кэш на 1 минуту
-				//w.redis.Set(context.Background(), attendanceStatusKey, STATUS_UNKNOWN, time.Minute*1)
-				//if telegramSendNotification {
-				//	notificationMessage := "✅ Вас скорее всего отметили на паре, но возникла техническая ошибка при проверке статуса. Проверьте свою посещаемость в системе МИРЭА."
-				//	w.bot.Send(tgbotapi.NewMessage(user.TelegramId, notificationMessage))
-				//}
 			} else {
 				if msg != nil {
 					if msg.GetSuccess() != nil {
-						// блок success не нулевой значит жб удалось отметить
 						w.response.Students[familyName] = STATUS_SUCCESS
-						// Сохраняем успешную отметку в кэш на 15 минут
 						w.redis.Set(context.Background(), attendanceStatusKey, STATUS_SUCCESS, time.Minute*15)
 						w.response.Subject = msg.GetSuccess().GetSubject()
 					} else {
-						// блок success пустой, значит там ошибка
 						if msg.GetFailed() != nil {
 							errStatus := msg.GetFailed().GetError()
 							switch errStatus {
 							case 1:
-								// QR просто устарел
 								w.response.Students[familyName] = STATUS_NOT_APPROVED
 								break
 							case 3:
-								// Сохраняем что пользователь не относится к паре в кэш на 1 минуту
 								if telegramSendNotification {
 									notificationMessage := "🏫 Вас пытались отметить на паре, к которой вы не закреплены"
-									w.bot.Send(tgbotapi.NewMessage(user.TelegramId, notificationMessage))
+									w.bot.Send(tgbotapi.NewMessage(u.TelegramId, notificationMessage))
 								}
 								w.redis.Set(context.Background(), attendanceStatusKey, STATUS_NOT_LESSON, time.Minute*1)
 								w.response.Students[familyName] = STATUS_NOT_LESSON
@@ -519,12 +502,10 @@ func (w *WorkerQR) Start() {
 							case 5:
 								w.redis.Set(context.Background(), "check_student_univ", true, time.Hour*48)
 								w.response.Students[familyName] = STATUS_NOT_IN_UNIVERSITY
-								// Send notification about university check
 								if telegramSendNotification {
 									notificationMessage := "🏫 Не удалось отметить вас на паре, вы не находитесь в университете."
-									w.bot.Send(tgbotapi.NewMessage(user.TelegramId, notificationMessage))
+									w.bot.Send(tgbotapi.NewMessage(u.TelegramId, notificationMessage))
 								}
-								// Сохраняем что студент не в вузе в кэш на 2 минуты
 								w.redis.Set(context.Background(), attendanceStatusKey, STATUS_NOT_IN_UNIVERSITY, time.Minute*2)
 								break
 							default:
@@ -537,13 +518,12 @@ func (w *WorkerQR) Start() {
 						}
 					}
 				} else {
-					// не удалось декодировать ответ
 					w.response.Students[familyName] = STATUS_ERROR
 				}
 			}
 
-			w.redis.Set(context.Background(), fmt.Sprintf("telegram_notification_%d", user.TelegramId), true, time.Minute*10)
+			w.redis.Set(context.Background(), fmt.Sprintf("telegram_notification_%d", u.TelegramId), true, time.Minute*10)
 			w.mutex.Unlock()
-		}(user)
+		}(user, delay)
 	}
 }
