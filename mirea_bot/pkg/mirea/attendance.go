@@ -28,10 +28,10 @@ import (
 
 var proxyBlockedErr = errors.New("proxy blocked")
 
-// URL-ы MIREA, для которых сохраняем/восстанавливаем cookies из Redis
+// URL-ы MIREA, обновлено на pulse.mirea.ru
 var mireaSessionURLs = []*url.URL{
 	mustParseURL("https://attendance.mirea.ru"),
-	mustParseURL("https://attendance-app.mirea.ru"),
+	mustParseURL("https://pulse.mirea.ru"),
 	mustParseURL("https://attendance.mirea.ru/api/mireaauth"),
 	mustParseURL("https://sso.mirea.ru/realms/mirea/"),
 }
@@ -70,7 +70,7 @@ func NewAttendance(cfg *config.Config, user entity.User, redis *redis.Client) *A
 
 	client.SetCookieJar(jar)
 	client.SetHeader("User-Agent", user.UserAgent)
-	client.SetTimeout(30 * time.Second) // ИСПРАВЛЕНО: Таймаут увеличен для 4G сетей
+	client.SetTimeout(30 * time.Second)
 
 	a := &Attendance{
 		config:     cfg,
@@ -92,7 +92,7 @@ func NewAttendance(cfg *config.Config, user entity.User, redis *redis.Client) *A
 func (a *Attendance) SetProxy() string {
 	randProxy, err := proxy.GetUserProxy(a.user.CustomProxy, a.redis)
 	if err != nil {
-		log.Printf("[PROXY WARNING] failed load proxy : %+v", err) // ИСПРАВЛЕНО: Убрали Fatalf
+		log.Printf("[PROXY WARNING] failed load proxy : %+v", err)
 		return ""
 	}
 	if randProxy != "" {
@@ -192,6 +192,21 @@ func (a *Attendance) loadSessionFromRedis() error {
 	return nil
 }
 
+// Загрузка сессии без попытки авторизации (Для сканнера)
+func (a *Attendance) LoadSessionOnly() error {
+	err := a.loadSessionFromRedis()
+	if err != nil {
+		return err
+	}
+
+	u, _ := url.Parse("https://attendance.mirea.ru")
+	cookies := a.client.CookieJar().Cookies(u)
+	if len(cookies) == 0 {
+		return errors.New("cookies missing in redis")
+	}
+	return nil
+}
+
 func (a *Attendance) getSessionKeyToRedis() string {
 	return "sess_" + a.user.Email
 }
@@ -224,8 +239,9 @@ func (a *Attendance) Authorization() error {
 		return err
 	}
 
+	// ОБНОВЛЕНО: redirectUri теперь указывает на pulse.mirea.ru
 	resp, err := a.client.R().
-		Get("https://attendance.mirea.ru/api/auth/login?redirectUri=https%3A%2F%2Fattendance-app.mirea.ru%2Fservices&rememberMe=True")
+		Get("https://attendance.mirea.ru/api/auth/login?redirectUri=https%3A%2F%2Fpulse.mirea.ru%2Fservices&rememberMe=True")
 	if err != nil {
 		if a.currentProxy != "" {
 			_ = proxy.BlockProxy(a.redis, a.currentProxy, 30*time.Second)
@@ -276,7 +292,8 @@ func (a *Attendance) Authorization() error {
 		return customerrors.NewAuthError("internal_error", "Система кеша не отвечает", err)
 	}
 
-	if redirects[0].URL != "https://attendance-app.mirea.ru/services" {
+	// ОБНОВЛЕНО: проверяем редирект на новый домен
+	if redirects[0].URL != "https://pulse.mirea.ru/services" {
 		loginRespStr := loginResp.String()
 		if strings.Contains(loginRespStr, `"pageId": "email-code-form"`) ||
 			strings.Contains(loginRespStr, `"pageId": "login-max-otp"`) {
@@ -314,7 +331,8 @@ func (a *Attendance) checkSiteAvailability() error {
 		return customerrors.NewAuthError("network_error", "Сайт MIREA не отвечает", errors.New("network error"))
 	}
 
-	if _, err := a.client.R().Get("https://attendance-app.mirea.ru/"); err != nil {
+	// ОБНОВЛЕНО
+	if _, err := a.client.R().Get("https://pulse.mirea.ru/"); err != nil {
 		if a.currentProxy != "" {
 			_ = proxy.BlockProxy(a.redis, a.currentProxy, 30*time.Second)
 		}
@@ -437,18 +455,19 @@ func (a *Attendance) makeGRPC(method string, request proto.Message, response pro
 	}
 
 	frame := make([]byte, 5)
-	frame[0] = 0 // no compression
+	frame[0] = 0
 	binary.BigEndian.PutUint32(frame[1:], uint32(len(data)))
 	payload := append(frame, data...)
 
+	// ОБНОВЛЕНО: Origin и Referer теперь указывают на Pulse
 	resp, err := a.client.R().
 		SetBody(payload).
 		SetHeader("Accept", "*"+"/"+"*").
 		SetHeader("Pulse-app-type", "pulse-app").
 		SetHeader("Pulse-app-version", a.appVersion).
 		SetHeader("Content-Type", "application/grpc-web+proto").
-		SetHeader("Origin", "https://attendance-app.mirea.ru").
-		SetHeader("Referer", "https://attendance-app.mirea.ru/").
+		SetHeader("Origin", "https://pulse.mirea.ru").
+		SetHeader("Referer", "https://pulse.mirea.ru/").
 		SetHeader("X-Grpc-Web", "1").
 		SetHeader("X-Requested-With", "XMLHttpRequest").
 		Post("https://attendance.mirea.ru/" + method)
@@ -456,6 +475,21 @@ func (a *Attendance) makeGRPC(method string, request proto.Message, response pro
 	if err != nil {
 		return err
 	}
+
+	// Дебаг-режим оставил, чтобы мы видели логи в случае проблем
+	if strings.Contains(method, "SelfApproveAttendance") {
+		fmt.Printf("\n========== DEBUG МИРЭА ==========\n")
+		fmt.Printf("Метод: %s\n", method)
+		fmt.Printf("Статус: %d\n", resp.StatusCode())
+		fmt.Printf("Заголовки ответа: %+v\n", resp.Header())
+		if len(resp.Bytes()) > 0 {
+			fmt.Printf("Сырое тело ответа (String): %s\n", resp.String())
+		} else {
+			fmt.Printf("Тело ответа ПУСТОЕ!\n")
+		}
+		fmt.Printf("=================================\n\n")
+	}
+
 	if resp.StatusCode() == 401 {
 		a.redis.Del(context.Background(), a.getSessionKeyToRedis())
 		return errors.New("unauthorized")
@@ -472,7 +506,7 @@ func (a *Attendance) makeGRPC(method string, request proto.Message, response pro
 
 	protoBytes, err := decodeGRPCBinaryResponse(resp.Bytes())
 	if err != nil {
-		return err
+		return fmt.Errorf("decode error: %v", err)
 	}
 
 	if err := proto.Unmarshal(protoBytes, response); err != nil {
@@ -484,7 +518,7 @@ func (a *Attendance) makeGRPC(method string, request proto.Message, response pro
 
 func (a *Attendance) GetMeInfo() (*message.Student, error) {
 	msg := &message.GetMeInfoRequest{
-		Url:   "https://attendance-app.mirea.ru",
+		Url:   "https://pulse.mirea.ru", // ОБНОВЛЕНО
 		Value: 1,
 	}
 
@@ -519,7 +553,7 @@ func (a *Attendance) GetAvailableGroup() (*GroupResponse, error) {
 	}
 
 	msg := &message.GetMeInfoRequest{
-		Url:   "https://attendance-app.mirea.ru",
+		Url:   "https://pulse.mirea.ru", // ОБНОВЛЕНО
 		Value: 1,
 	}
 
@@ -566,7 +600,9 @@ func (a *Attendance) SelfApproveAttendance(token string) (*message.SelfApproveAt
 	}
 
 	response := &message.SelfApproveAttendanceResponse{}
-	if err := a.makeGRPC("rtu_tc.attendance.api.StudentService/SelfApproveAttendance", msg, response); err != nil {
+	
+	// 🎯 НОВОЕ ИМЯ МЕТОДА
+	if err := a.makeGRPC("rtu_tc.attendance.api.StudentService/SelfApproveAttendanceThroughQRCode", msg, response); err != nil {
 		return nil, err
 	}
 
@@ -651,12 +687,12 @@ func (a *Attendance) GetAcademicGroupInfo(uuid string) (*message.GetAcademicGrou
 }
 
 func (a *Attendance) makeGRPCBytes(method string, requestBytes []byte) ([]byte, error) {
-	return a.makeGRPCBytesWithOrigin(method, requestBytes, "https://attendance-app.mirea.ru")
+	return a.makeGRPCBytesWithOrigin(method, requestBytes, "https://pulse.mirea.ru") // ОБНОВЛЕНО
 }
 
 func (a *Attendance) makeGRPCBytesWithOrigin(method string, requestBytes []byte, origin string) ([]byte, error) {
 	frame := make([]byte, 5)
-	frame[0] = 0 // no compression
+	frame[0] = 0
 	binary.BigEndian.PutUint32(frame[1:], uint32(len(requestBytes)))
 	payload := append(frame, requestBytes...)
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"mirea-qr/internal/app"
 	"mirea-qr/internal/config"
+	"mirea-qr/internal/worker"
 	"mirea-qr/pkg/crypto"
 )
 
@@ -32,6 +33,11 @@ func main() {
 		Bot:       bot,
 		Encryptor: encryptor,
 	})
+
+	// Инициализация и запуск воркера сессий (Stealth Mode)
+	warmer := worker.NewSessionWarmer(db, redis, &cfg, encryptor, logger)
+	warmer.Start()
+
 	if err := fiber.Listen(fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)); err != nil {
 		logger.Fatalf("Failed to start server: %v", err)
 	}

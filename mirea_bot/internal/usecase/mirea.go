@@ -5,6 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+
 	"mirea-qr/internal/config"
 	"mirea-qr/internal/entity"
 	"mirea-qr/internal/model"
@@ -12,9 +17,6 @@ import (
 	"mirea-qr/pkg/crypto"
 	"mirea-qr/pkg/customerrors"
 	"mirea-qr/pkg/mirea"
-	"strings"
-	"sync"
-	"time"
 
 	"github.com/go-playground/validator/v10"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -389,13 +391,32 @@ func (c *MireaUseCase) ScanQR(ctx context.Context, request *model.ScanQRRequest,
 		encryptor: c.Encryptor,
 	}
 
-	parts := strings.Split(request.URL, "?token=")
-	if len(parts) < 2 {
-		return worker.response, fiber.NewError(400, "QR код не относится к МИРЭА")
+	// 🚨 БЕЗОПАСНЫЙ ПАРСИНГ ССЫЛКИ 🚨
+	parsedURL, err := url.Parse(request.URL)
+	if err != nil {
+		c.Log.Warnf("Failed to parse URL: %s", request.URL)
+		return worker.response, fiber.NewError(400, "Неверный формат ссылки")
 	}
-	
-	// Очищаем токен от лишнего мусора, который могут добавить сканеры
-	token := parts[1]
+
+	// Извлекаем токен из query-параметров.
+	// Пытаемся найти параметры "token", "code", "id", или "uuid" (МИРЭА могли изменить название)
+	token := parsedURL.Query().Get("token")
+	if token == "" {
+		token = parsedURL.Query().Get("code")
+	}
+	if token == "" {
+		token = parsedURL.Query().Get("id")
+	}
+	if token == "" {
+		token = parsedURL.Query().Get("uuid")
+	}
+
+	// Если токен так и не найден, или ссылка ведет не на МИРЭА
+	if token == "" || (!strings.Contains(parsedURL.Host, "mirea.ru")) {
+		return worker.response, fiber.NewError(400, "QR код не относится к МИРЭА или не содержит токена")
+	}
+
+	// Очищаем токен от лишнего мусора (на всякий случай)
 	token = strings.Split(token, "&")[0]
 	token = strings.Split(token, "#")[0]
 	worker.uuid = token
